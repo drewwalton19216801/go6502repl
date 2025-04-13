@@ -252,6 +252,58 @@ func (m *model) handleSet(args []string) {
 	}
 }
 
+func (m *model) handleGet(args []string) {
+	if len(args) < 3 {
+		m.err = fmt.Errorf("usage: get <reg|mem> <name|address>")
+		return
+	}
+	targetType := strings.ToLower(args[1])
+	targetName := args[2]
+
+	var output string
+
+	switch targetType {
+	case "reg":
+		regNameUpper := strings.ToUpper(targetName)
+		switch regNameUpper {
+		case "A":
+			output = fmt.Sprintf("Register A = $%02X (%d)", m.cpu.A, m.cpu.A)
+		case "X":
+			output = fmt.Sprintf("Register X = $%02X (%d)", m.cpu.X, m.cpu.X)
+		case "Y":
+			output = fmt.Sprintf("Register Y = $%02X (%d)", m.cpu.Y, m.cpu.Y)
+		case "SP":
+			output = fmt.Sprintf("Register SP = $%02X", m.cpu.SP)
+		case "PC":
+			output = fmt.Sprintf("Register PC = $%04X", m.cpu.PC)
+		case "P":
+			// Use the existing formatter
+			flagsStr := cpu.FormatFlags(m.cpu.P)
+			output = fmt.Sprintf("Register P = $%02X [%s]", uint8(m.cpu.P), flagsStr)
+		default:
+			m.err = fmt.Errorf("unknown register: %s (Valid: A, X, Y, SP, PC, P)", targetName)
+			m.updateViewport(m.generateStatus()) // Show error and status
+			return
+		}
+		m.updateViewport(output + "\n" + m.generateStatus())
+
+	case "mem":
+		addr, err := parseHex16(targetName)
+		if err != nil {
+			m.err = err
+			m.updateViewport(m.generateStatus()) // Show error and status
+			return
+		}
+		val := m.ram.Read(addr)
+		output = fmt.Sprintf("Memory [$%04X] = $%02X (%d)", addr, val, val)
+		m.updateViewport(output + "\n" + m.generateStatus())
+
+	default:
+		m.err = fmt.Errorf("invalid get target type: %s (Valid: reg, mem)", targetType)
+		m.updateViewport(m.generateStatus()) // Show error and status
+	}
+}
+
 func (m *model) handleHelp() {
 	helpText := `
 Available Commands:
@@ -265,6 +317,10 @@ Available Commands:
                          (e.g., set reg A $FF, set reg PC $C000)
   set mem <addr> <val>   Write byte <val> (hex) to memory address <addr> (hex).
                          (e.g., set mem $0200 $A9)
+  get reg <reg>          Show the value of CPU register <reg> (A, X, Y, SP, PC, P).
+                         (e.g., get reg P, get reg PC)
+  get mem <addr>         Show the byte value at memory address <addr> (hex).
+                         (e.g., get mem $0200)
   quit / exit            Exit the REPL.
   Up/Down Arrows         Navigate command history.
 `
@@ -343,6 +399,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.handleMem(parts)
 			case "set":
 				m.handleSet(parts)
+			case "get":
+				m.handleGet(parts)
 			case "reset":
 				m.cpu.Reset()
 				m.updateViewport("CPU Reset.\n" + m.generateStatus())

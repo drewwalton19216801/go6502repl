@@ -2,478 +2,485 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	cpu "github.com/drewwalton19216801/sixty502" // Use the original path from the prompt
-	// Or, if using local module path:
-	// cpu "<your-module-path>/cpu6502"
+	cpu "github.com/drewwalton19216801/sixty502" // Adjust import path if needed
+)
+
+const serialAddr uint16 = 0xF001
+const defaultLoadAddr uint16 = 0x0200 // Common area for small programs
+
+// --- Test Program ---
+// Simple program to write "Hello World!\n" to serial output (0xF001)
+// and then loop indefinitely.
+// Org $0200
+var helloWorldProgram = []uint8{
+	// Start:
+	0xA2, 0x00, // LDX #$00      ; X = 0 (index into message)
+	// Loop:
+	0xBD, 0x10, 0x02, // LDA Message,X ; Load character A = RAM[0x0210 + X]
+	0x8D, 0x01, 0xF0, // STA $F001     ; Write character to serial
+	0xE8,       // INX             ; Increment index
+	0xE0, 0x0E, // CPX #$0E      ; Compare X to length (14 chars incl. null)
+	0xD0, 0xF5, // BNE Loop      ; Branch back if not equal
+	// Halt:
+	0x4C, 0x0C, 0x02, // JMP Halt      ; Infinite loop jump to self (0x020C)
+	// Message: (Starts at 0x0210)
+	'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!', '\n', 0x00, // The message + null terminator
+}
+
+// --- Bubbletea Model ---
+
+type Mode int
+
+const (
+	CommandMode Mode = iota
+	RunningMode
 )
 
 type model struct {
-	cpu       *cpu.CPU
-	ram       *RAM
-	viewport  viewport.Model
+	cpu    *cpu.CPU
+	bus    *MainBus
+	serial *SerialDevice
+
 	textInput textinput.Model
+	mode      Mode
 	err       error
-	ready     bool     // Flag to indicate if viewport is initialized
-	history   []string // Simple command history
-	histPos   int
+	message   string // General status messages
+
+	width, height int
+
+	// View state
+	memViewAddr    uint16
+	disassembly    map[uint16]string
+	memViewContent string
+	serialOutput   string
+
+	// Style
+	styleHelp      lipgloss.Style
+	styleCPU       lipgloss.Style
+	styleDisasm    lipgloss.Style
+	styleMemory    lipgloss.Style
+	styleSerial    lipgloss.Style
+	styleInput     lipgloss.Style
+	styleStatus    lipgloss.Style
+	styleHighlight lipgloss.Style
 }
 
-const (
-	historyMax = 50
-)
+type tickMsg time.Time
 
 func initialModel() model {
-	ram := NewRAM()
-	cpuInstance := cpu.NewCPU(ram)
-	cpuInstance.Reset() // Start in a known state
+	// --- Device Setup ---
+	serialDev := NewSerialDevice(serialAddr)
+	mainBus := NewBus(serialDev)
+	cpuCore := cpu.NewCPU(mainBus)
 
+	// --- Input Setup ---
 	ti := textinput.New()
-	ti.Placeholder = "Enter command (help, load, step, mem, set, reset, quit)..."
+	ti.Placeholder = "Enter command (h for help)..."
 	ti.Focus()
 	ti.CharLimit = 156
-	ti.Width = 20 // Initial width, will be updated
+	ti.Width = 50
 
-	// Viewport will be initialized fully in Update when size is known
-	vp := viewport.New(0, 0) // Initial dummy size
-
-	return model{
-		cpu:       cpuInstance,
-		ram:       ram,
-		textInput: ti,
-		viewport:  vp,
-		histPos:   -1, // No history selected
+	// --- Load Program ---
+	err := mainBus.LoadProgram(defaultLoadAddr, helloWorldProgram)
+	if err != nil {
+		log.Fatalf("Failed to load program: %v", err) // Fatal on initial load fail
 	}
+	cpuCore.PC = defaultLoadAddr // Set PC to start of loaded program
+	// cpuCore.Reset() // Alternatively, if program is at reset vector target
+
+	m := model{
+		cpu:            cpuCore,
+		bus:            mainBus,
+		serial:         serialDev,
+		textInput:      ti,
+		mode:           CommandMode,
+		memViewAddr:    defaultLoadAddr, // Start memory view near code
+		styleHelp:      lipgloss.NewStyle().Faint(true),
+		styleCPU:       lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
+		styleDisasm:    lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
+		styleMemory:    lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
+		styleSerial:    lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).Foreground(lipgloss.Color("10")), // Green
+		styleInput:     lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
+		styleStatus:    lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
+		styleHighlight: lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("15")), // Highlight PC line
+	}
+
+	m.updateViews() // Initial view rendering content
+	return m
 }
 
 func (m model) Init() tea.Cmd {
 	return textinput.Blink // Start the cursor blinking
 }
 
-// Helper to update viewport content and scroll to bottom
-func (m *model) updateViewport(content string) {
-	if !m.ready {
-		return // Don't update if not ready
-	}
-	m.viewport.SetContent(content)
-	m.viewport.GotoBottom()
-}
+// --- Update Logic ---
 
-// Generates the status/help/CPU state string for the viewport
-func (m *model) generateStatus() string {
-	cpuState := m.cpu.GetState()
-	errorMessage := ""
-	if m.err != nil {
-		errorMessage = fmt.Sprintf("\nError: %v", m.err)
-		m.err = nil // Clear error after displaying
-	}
-	helpHint := "\nCommands: help, load <f> <addr>, step, mem <addr> [n], set <reg|mem> ..., reset, quit"
-	return cpuState + errorMessage + helpHint
-}
-
-// Parses hex numbers (e.g., $FF, 0xFF, FF)
-func parseHex16(s string) (uint16, error) {
-	s = strings.TrimPrefix(s, "$")
-	s = strings.TrimPrefix(s, "0x")
-	val, err := strconv.ParseUint(s, 16, 16)
-	if err != nil {
-		return 0, fmt.Errorf("invalid hex address '%s': %w", s, err)
-	}
-	return uint16(val), nil
-}
-
-func parseHex8(s string) (uint8, error) {
-	s = strings.TrimPrefix(s, "$")
-	s = strings.TrimPrefix(s, "0x")
-	val, err := strconv.ParseUint(s, 16, 8)
-	if err != nil {
-		return 0, fmt.Errorf("invalid hex value '%s': %w", s, err)
-	}
-	return uint8(val), nil
-}
-
-// --- Command Handlers ---
-
-func (m *model) handleLoad(args []string) {
-	if len(args) != 3 {
-		m.err = fmt.Errorf("usage: load <filename> <hex_address>")
-		return
-	}
-	filename := args[1]
-	addrStr := args[2]
-
-	addr, err := parseHex16(addrStr)
-	if err != nil {
-		m.err = err
-		return
-	}
-
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		m.err = fmt.Errorf("could not read file '%s': %w", filename, err)
-		return
-	}
-
-	err = m.ram.Load(addr, data)
-	if err != nil {
-		m.err = err
-		return
-	}
-	m.updateViewport(fmt.Sprintf("Loaded %d bytes from '%s' to $%04X.\n%s", len(data), filename, addr, m.generateStatus()))
-}
-
-func (m *model) handleStep() {
-	// Execute cycles until the current instruction is complete
-	startCycles := m.cpu.TotalCycles()
-	if m.cpu.Cycles == 0 {
-		m.cpu.Clock() // Fetch and start the next instruction if needed
-	}
-	for m.cpu.Cycles > 0 {
-		m.cpu.Clock()
-	}
-	// Ensure at least one full instruction cycle has passed if we started mid-instruction
-	if m.cpu.Cycles == 0 && m.cpu.TotalCycles() == startCycles {
-		m.cpu.Clock() // Fetch next
-		for m.cpu.Cycles > 0 {
-			m.cpu.Clock()
-		}
-	}
-
-	// Optional: Show disassembly of *next* instruction
-	disasm := m.cpu.Disassemble(m.cpu.PC, m.cpu.PC+3) // Look ahead a bit
-	nextInstrStr := ""
-	if line, ok := disasm[m.cpu.PC]; ok {
-		nextInstrStr = "\nNext: " + line
-	}
-
-	m.updateViewport(m.generateStatus() + nextInstrStr)
-}
-
-func (m *model) handleMem(args []string) {
-	if len(args) < 2 {
-		m.err = fmt.Errorf("usage: mem <hex_address> [count]")
-		return
-	}
-	addrStr := args[1]
-	count := 16 // Default count
-
-	addr, err := parseHex16(addrStr)
-	if err != nil {
-		m.err = err
-		return
-	}
-
-	if len(args) > 2 {
-		countVal, err := strconv.Atoi(args[2])
-		if err != nil || countVal <= 0 {
-			m.err = fmt.Errorf("invalid count '%s'", args[2])
-			return
-		}
-		count = countVal
-	}
-
-	memDump := m.ram.Dump(addr, count)
-	m.updateViewport(memDump + m.generateStatus())
-}
-
-func (m *model) handleSet(args []string) {
-	if len(args) < 4 {
-		m.err = fmt.Errorf("usage: set <reg|mem> <name|address> <value>")
-		return
-	}
-	targetType := strings.ToLower(args[1])
-	targetName := args[2]
-	valueStr := args[3]
-
-	switch targetType {
-	case "reg":
-		val, err := parseHex8(valueStr) // Most registers are 8-bit
-		if err != nil && strings.ToUpper(targetName) != "PC" && strings.ToUpper(targetName) != "P" {
-			m.err = err
-			return
-		}
-
-		switch strings.ToUpper(targetName) {
-		case "A":
-			m.cpu.A = val
-		case "X":
-			m.cpu.X = val
-		case "Y":
-			m.cpu.Y = val
-		case "SP":
-			m.cpu.SP = val
-		case "PC":
-			pcVal, err := parseHex16(valueStr) // PC is 16-bit
-			if err != nil {
-				m.err = err
-				return
-			}
-			m.cpu.PC = pcVal
-		case "P":
-			// Allow setting flags via hex value
-			pVal, err := parseHex8(valueStr)
-			if err != nil {
-				m.err = err
-				return
-			}
-			m.cpu.P = cpu.Flags(pVal) | cpu.U // Ensure U is always set
-		default:
-			m.err = fmt.Errorf("unknown register: %s (Valid: A, X, Y, SP, PC, P)", targetName)
-			return
-		}
-		m.updateViewport(m.generateStatus())
-
-	case "mem":
-		addr, err := parseHex16(targetName)
-		if err != nil {
-			m.err = err
-			return
-		}
-		val, err := parseHex8(valueStr)
-		if err != nil {
-			m.err = err
-			return
-		}
-		m.ram.Write(addr, val)
-		m.updateViewport(fmt.Sprintf("Wrote $%02X to $%04X.\n%s", val, addr, m.generateStatus()))
-
-	default:
-		m.err = fmt.Errorf("invalid set target type: %s (Valid: reg, mem)", targetType)
-	}
-}
-
-func (m *model) handleGet(args []string) {
-	if len(args) < 3 {
-		m.err = fmt.Errorf("usage: get <reg|mem> <name|address>")
-		return
-	}
-	targetType := strings.ToLower(args[1])
-	targetName := args[2]
-
-	var output string
-
-	switch targetType {
-	case "reg":
-		regNameUpper := strings.ToUpper(targetName)
-		switch regNameUpper {
-		case "A":
-			output = fmt.Sprintf("Register A = $%02X (%d)", m.cpu.A, m.cpu.A)
-		case "X":
-			output = fmt.Sprintf("Register X = $%02X (%d)", m.cpu.X, m.cpu.X)
-		case "Y":
-			output = fmt.Sprintf("Register Y = $%02X (%d)", m.cpu.Y, m.cpu.Y)
-		case "SP":
-			output = fmt.Sprintf("Register SP = $%02X", m.cpu.SP)
-		case "PC":
-			output = fmt.Sprintf("Register PC = $%04X", m.cpu.PC)
-		case "P":
-			// Use the existing formatter
-			flagsStr := cpu.FormatFlags(m.cpu.P)
-			output = fmt.Sprintf("Register P = $%02X [%s]", uint8(m.cpu.P), flagsStr)
-		default:
-			m.err = fmt.Errorf("unknown register: %s (Valid: A, X, Y, SP, PC, P)", targetName)
-			m.updateViewport(m.generateStatus()) // Show error and status
-			return
-		}
-		m.updateViewport(output + "\n" + m.generateStatus())
-
-	case "mem":
-		addr, err := parseHex16(targetName)
-		if err != nil {
-			m.err = err
-			m.updateViewport(m.generateStatus()) // Show error and status
-			return
-		}
-		val := m.ram.Read(addr)
-		output = fmt.Sprintf("Memory [$%04X] = $%02X (%d)", addr, val, val)
-		m.updateViewport(output + "\n" + m.generateStatus())
-
-	default:
-		m.err = fmt.Errorf("invalid get target type: %s (Valid: reg, mem)", targetType)
-		m.updateViewport(m.generateStatus()) // Show error and status
-	}
-}
-
-func (m *model) handleHelp() {
-	helpText := `
-Available Commands:
-  help                   Show this help message.
-  load <file> <addr>     Load binary <file> into memory at <addr> (e.g., load prog.bin $C000).
-  step / s               Execute the next CPU instruction.
-  reset                  Reset the CPU state.
-  mem <addr> [count]     Show memory starting at <addr> (hex) for [count] bytes (default 16).
-                         (e.g., mem $0100, mem $C000 32)
-  set reg <reg> <val>    Set CPU register <reg> (A, X, Y, SP, PC, P) to <val> (hex).
-                         (e.g., set reg A $FF, set reg PC $C000)
-  set mem <addr> <val>   Write byte <val> (hex) to memory address <addr> (hex).
-                         (e.g., set mem $0200 $A9)
-  get reg <reg>          Show the value of CPU register <reg> (A, X, Y, SP, PC, P).
-                         (e.g., get reg P, get reg PC)
-  get mem <addr>         Show the byte value at memory address <addr> (hex).
-                         (e.g., get mem $0200)
-  quit / exit            Exit the REPL.
-  Up/Down Arrows         Navigate command history.
-`
-	m.updateViewport(helpText + "\n" + m.generateStatus())
-}
-
-// Adds command to history
-func (m *model) addHistory(cmd string) {
-	if cmd == "" {
-		return
-	}
-	// Avoid adding consecutive duplicates
-	if len(m.history) > 0 && m.history[len(m.history)-1] == cmd {
-		return
-	}
-	m.history = append(m.history, cmd)
-	if len(m.history) > historyMax {
-		m.history = m.history[len(m.history)-historyMax:]
-	}
-	m.histPos = len(m.history) // Reset history position after adding
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Millisecond*1, func(t time.Time) tea.Msg { // Faster tick for smoother run?
+		return tickMsg(t)
+	})
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-	var cmds []tea.Cmd // Use slice for multiple commands
+	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
-			return m, tea.Quit
-		case tea.KeyUp:
-			if len(m.history) > 0 {
-				if m.histPos == len(m.history) { // If at the new command line
-					m.histPos = len(m.history) - 1
-					m.textInput.SetValue(m.history[m.histPos])
-				} else if m.histPos > 0 {
-					m.histPos--
-					m.textInput.SetValue(m.history[m.histPos])
-				}
-				m.textInput.CursorEnd()
-			}
-		case tea.KeyDown:
-			if len(m.history) > 0 && m.histPos < len(m.history) {
-				if m.histPos == len(m.history)-1 {
-					m.histPos = len(m.history) // Go to "new command" line
-					m.textInput.SetValue("")
-				} else {
-					m.histPos++
-					m.textInput.SetValue(m.history[m.histPos])
-					m.textInput.CursorEnd()
-				}
-			}
+		switch m.mode {
+		case CommandMode:
+			switch msg.Type {
+			case tea.KeyEnter:
+				input := m.textInput.Value()
+				m.textInput.SetValue("") // Clear input
+				m.err = nil              // Clear previous error
+				m.message = ""           // Clear previous message
+				cmds = append(cmds, m.handleCommand(input))
+				m.updateViews() // Update display after command
 
-		case tea.KeyEnter:
-			input := strings.TrimSpace(m.textInput.Value())
-			m.addHistory(input) // Add command to history
-			m.textInput.Reset()
-			m.histPos = len(m.history) // Reset history position
-
-			if input == "" {
-				break
-			}
-
-			parts := strings.Fields(input)
-			command := strings.ToLower(parts[0])
-
-			switch command {
-			case "quit", "exit":
+			case tea.KeyCtrlC, tea.KeyEsc:
 				return m, tea.Quit
-			case "load":
-				m.handleLoad(parts)
-			case "step", "s":
-				m.handleStep()
-			case "mem":
-				m.handleMem(parts)
-			case "set":
-				m.handleSet(parts)
-			case "get":
-				m.handleGet(parts)
-			case "reset":
-				m.cpu.Reset()
-				m.updateViewport("CPU Reset.\n" + m.generateStatus())
-			case "help":
-				m.handleHelp()
+
 			default:
-				m.err = fmt.Errorf("unknown command: %s", command)
-				m.updateViewport(m.generateStatus()) // Show error
+				// Let the text input handle the key press
+				m.textInput, cmd = m.textInput.Update(msg)
+				cmds = append(cmds, cmd)
 			}
 
-		default:
-			// Allow viewport scrolling when not focused on text input (future enhancement maybe)
-			// For now, only handle input keys
-			m.textInput, cmd = m.textInput.Update(msg)
-			cmds = append(cmds, cmd)
+		case RunningMode:
+			switch msg.Type {
+			case tea.KeyCtrlC, tea.KeyEsc:
+				m.mode = CommandMode // Pause execution
+				m.message = "Execution paused."
+				m.textInput.Focus() // Focus input field when pausing
+				cmds = append(cmds, textinput.Blink)
+				m.updateViews()
+			}
+		}
+
+	case tickMsg:
+		if m.mode == RunningMode {
+			// Execute one CPU clock cycle
+			m.cpu.Clock()
+			// Continue ticking only if Cycles > 0 or if instruction finished
+			if m.cpu.Cycles == 0 {
+				// Instruction finished, update views and schedule next instruction fetch/exec
+				m.updateViews() // Update potentially slow things less often
+			}
+			// Keep ticking to finish current instruction or start next
+			cmds = append(cmds, tickCmd())
 		}
 
 	case tea.WindowSizeMsg:
-		// Set up viewport and text input width on initial size message
-		headerHeight := 1 // For CPU state line maybe (adjust as needed)
-		footerHeight := 1 // For input line
+		m.width = msg.Width
+		m.height = msg.Height
+		// Re-calculate layout dimensions if needed here
+		m.updateViews() // Update views with new size info
 
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-headerHeight-footerHeight)
-			m.viewport.YPosition = headerHeight
-			m.ready = true
-			m.updateViewport(m.generateStatus()) // Initial content
-		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - headerHeight - footerHeight
-		}
-		m.textInput.Width = msg.Width - 2 // Leave some padding
-
-	default:
-		// Handle other messages (like Blink)
-		m.textInput, cmd = m.textInput.Update(msg)
-		cmds = append(cmds, cmd)
-
-		// Update viewport only if necessary (less frequent updates might be better)
-		// m.viewport, cmd = m.viewport.Update(msg)
-		// cmds = append(cmds, cmd)
+	case error: // Handle errors passed as messages
+		m.err = msg
+		m.message = fmt.Sprintf("Error: %v", msg) // Display error
 	}
 
-	// Handle viewport updates separately if needed, e.g., for scrolling keys
-	// but usually SetContent is enough after commands.
-	m.viewport, cmd = m.viewport.Update(msg)
-	cmds = append(cmds, cmd)
-
-	return m, tea.Batch(cmds...) // Combine commands
+	return m, tea.Batch(cmds...)
 }
 
-var (
-	// Basic styling
-	inputStyle = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).Padding(0, 1)
-)
+// handleCommand processes user input from the text field.
+func (m *model) handleCommand(input string) tea.Cmd {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return nil // No command entered
+	}
+	command := strings.ToLower(parts[0])
+
+	switch command {
+	case "h", "help":
+		m.message = "Commands: s[tep], r[un], p[ause], reset, m[em] <addr>, d[isasm], ser[ial], q[uit]"
+	case "s", "step":
+		// Execute one full instruction
+		m.message = "Stepping..."
+		// Clock until the current instruction completes
+		startCycles := m.cpu.TotalCycles()
+		if m.cpu.Cycles == 0 { // If already at boundary, clock once to fetch
+			m.cpu.Clock()
+		}
+		for m.cpu.Cycles > 0 {
+			m.cpu.Clock()
+		}
+		m.message = fmt.Sprintf("Stepped. PC=%04X. Took %d cycles.", m.cpu.PC, m.cpu.TotalCycles()-startCycles)
+	case "r", "run":
+		if m.mode == RunningMode {
+			m.message = "Already running."
+			return nil
+		}
+		m.mode = RunningMode
+		m.message = "Running... (Press Ctrl+C or Esc to pause)"
+		m.textInput.Blur() // Unfocus input field while running
+		return tickCmd()   // Start the execution ticks
+	case "p", "pause":
+		if m.mode == CommandMode {
+			m.message = "Already paused."
+			return nil
+		}
+		m.mode = CommandMode
+		m.message = "Execution paused."
+		m.textInput.Focus()
+		return textinput.Blink
+	case "reset":
+		m.cpu.Reset()
+		m.serial.ClearOutput()
+		// Reload program and set PC after reset
+		err := m.bus.LoadProgram(defaultLoadAddr, helloWorldProgram)
+		if err != nil {
+			m.err = err
+			m.message = fmt.Sprintf("Error reloading program: %v", err)
+		} else {
+			m.cpu.PC = defaultLoadAddr
+			m.message = "CPU Reset. Program reloaded. PC set to $0200."
+		}
+	case "m", "mem":
+		if len(parts) < 2 {
+			m.message = "Usage: m <addr> (e.g., m 0200 or m $C000)"
+			return nil
+		}
+		addrStr := strings.TrimPrefix(parts[1], "$")
+		addr, err := strconv.ParseUint(addrStr, 16, 16)
+		if err != nil {
+			m.err = fmt.Errorf("invalid address format: %w", err)
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+		m.memViewAddr = uint16(addr)
+		m.message = fmt.Sprintf("Memory view centered at $%04X", m.memViewAddr)
+	case "d", "disasm":
+		// Disassembly view is updated automatically, but this forces refresh
+		m.message = "Disassembly view refreshed."
+	case "ser", "serial":
+		// Serial view is updated automatically, this command could be used
+		// for other serial actions later (e.g., clear, show status)
+		m.message = "Serial output view refreshed."
+	case "q", "quit":
+		return tea.Quit
+	default:
+		m.message = fmt.Sprintf("Unknown command: %s. Type 'h' for help.", command)
+	}
+	return nil
+}
+
+// updateViews prepares the display strings for rendering.
+func (m *model) updateViews() {
+	// --- Disassembly ---
+	// Show ~10 lines around PC
+	disasmLines := 10
+	startAddr := m.cpu.PC
+	// Try to center PC, adjusting for start/end of memory
+	if startAddr > uint16(disasmLines/2)*3 { // Assume ~3 bytes/instr avg
+		startAddr -= uint16(disasmLines/2) * 3
+	} else {
+		startAddr = 0
+	}
+	// Read ahead enough bytes for potential instructions
+	m.disassembly = m.cpu.Disassemble(startAddr, startAddr+uint16(disasmLines*4)) // Read a bit more
+
+	// --- Memory View ---
+	memLines := 8
+	bytesPerLine := 16
+	memData := m.bus.ReadRange(m.memViewAddr, memLines*bytesPerLine)
+	var memBuilder strings.Builder
+	for i := 0; i < memLines; i++ {
+		lineAddr := m.memViewAddr + uint16(i*bytesPerLine)
+		memBuilder.WriteString(fmt.Sprintf("%04X: ", lineAddr))
+		lineData := memData[i*bytesPerLine : (i+1)*bytesPerLine]
+
+		// Hex bytes
+		for j := 0; j < bytesPerLine; j++ {
+			if i*bytesPerLine+j >= len(memData) {
+				memBuilder.WriteString("   ") // Padding if data ends
+			} else {
+				memBuilder.WriteString(fmt.Sprintf("%02X ", lineData[j]))
+			}
+		}
+		memBuilder.WriteString(" ")
+
+		// ASCII representation
+		for j := 0; j < bytesPerLine; j++ {
+			if i*bytesPerLine+j >= len(memData) {
+				memBuilder.WriteByte(' ')
+			} else {
+				char := lineData[j]
+				if char < 32 || char > 126 {
+					memBuilder.WriteByte('.')
+				} else {
+					memBuilder.WriteByte(char)
+				}
+			}
+		}
+		memBuilder.WriteString("\n")
+	}
+	m.memViewContent = strings.TrimRight(memBuilder.String(), "\n")
+
+	// --- Serial Output ---
+	m.serialOutput = m.serial.GetOutput()
+}
+
+// --- View Rendering ---
 
 func (m model) View() string {
-	if !m.ready {
+	if m.width == 0 || m.height == 0 { // Check height too
 		return "Initializing..."
 	}
-	// Combine viewport content and text input
-	return fmt.Sprintf(
-		"%s\n%s",
-		m.viewport.View(),                     // The main content area
-		inputStyle.Render(m.textInput.View()), // The input field at the bottom
+
+	// --- Calculate Footer Height ---
+	// Measure or estimate the height needed for the input field and help text.
+	// Input field with border typically takes 3 lines (1 for text, 2 for top/bottom border).
+	// Help text takes 1 line.
+	inputHeight := 3 // Based on text + rounded border
+	helpHeight := 1
+	footerHeight := inputHeight + helpHeight
+
+	// --- Prepare Content Sections ---
+	// CPU State (This will be part of the main scrollable/resizable area)
+	cpuState := m.styleCPU.Render(m.cpu.GetState())
+
+	// Disassembly (as before)
+	var disasmBuilder strings.Builder
+	disasmBuilder.WriteString("Disassembly:\n")
+	linesRendered := 0
+	renderedPCLine := false
+	// Get sorted addresses for deterministic rendering
+	// NOTE: Disassemble returns a map, iteration order isn't guaranteed.
+	// For a truly stable view, sort the keys or disassemble line-by-line.
+	// This simplified version might still jump slightly if PC isn't the first key.
+	// A more robust way: Disassemble a fixed range *starting* near PC.
+	keys := make([]uint16, 0, len(m.disassembly))
+	for k := range m.disassembly {
+		keys = append(keys, k)
+	}
+	// Simple sort (might not be perfect instruction order, but better than map)
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[i] > keys[j] {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
+		}
+	}
+
+	for _, addr := range keys {
+		line := m.disassembly[addr] // Get line from original map
+		lineStr := fmt.Sprintf("%04X: %s", addr, line)
+		if addr == m.cpu.PC {
+			disasmBuilder.WriteString(m.styleHighlight.Render(lineStr) + "\n")
+			renderedPCLine = true
+		} else {
+			disasmBuilder.WriteString(lineStr + "\n")
+		}
+		linesRendered++
+		if linesRendered >= 15 { // Render a few more lines for context
+			break
+		}
+	}
+	// If PC wasn't in the rendered block (e.g., near end of mem), add it
+	if !renderedPCLine && linesRendered < 15 {
+		op := m.bus.Read(m.cpu.PC)
+		instr := m.cpu.LookupTable()[op] // Use the getter method here
+		pcLine := fmt.Sprintf("%04X: %s ???", m.cpu.PC, instr.Name)
+		disasmBuilder.WriteString(m.styleHighlight.Render(pcLine) + "\n")
+	}
+	disasmView := m.styleDisasm.Render(strings.TrimSpace(disasmBuilder.String()))
+
+	// Memory View (as before)
+	memoryView := m.styleMemory.Render(fmt.Sprintf("Memory @ $%04X:\n%s", m.memViewAddr, m.memViewContent))
+
+	// Serial Output (as before)
+	serialRender := m.styleSerial.Render(fmt.Sprintf("Serial Output ($%04X):\n%s", serialAddr, m.serialOutput))
+
+	// Status/Message Area (as before)
+	statusMsg := m.message
+	if m.err != nil {
+		statusMsg = fmt.Sprintf("Error: %v", m.err)
+	}
+	statusArea := m.styleStatus.Render(statusMsg)
+
+	// --- Layout Panels ---
+	// Combine left and right panels like before
+	leftPanel := lipgloss.JoinVertical(lipgloss.Left,
+		disasmView,
+		serialRender,
 	)
+
+	rightPanel := lipgloss.JoinVertical(lipgloss.Left,
+		memoryView,
+		statusArea,
+	)
+
+	// Combine CPU state and the main horizontal panels vertically
+	// This is the content that needs to fit *above* the footer.
+	mainContent := lipgloss.JoinVertical(lipgloss.Left,
+		cpuState,
+		lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel),
+	)
+
+	// --- Calculate Main Content Height ---
+	// The main content should fill the space NOT taken by the footer
+	mainHeight := m.height - footerHeight
+	if mainHeight < 0 { // Prevent negative height if terminal is tiny
+		mainHeight = 0
+	}
+
+	// --- Render Footer ---
+	// Render input and help text separately for the footer
+	inputArea := m.styleInput.Render(m.textInput.View())
+	helpHint := m.styleHelp.Render("step(s) run(r) pause(p) reset mem(m) serial(ser) help(h) quit(q)")
+
+	// --- Final Assembly ---
+	// Render the main content with a *maximum* height constraint.
+	// Lipgloss will handle truncation or vertical overflow if the content is taller.
+	mainContentView := lipgloss.NewStyle().
+		Height(mainHeight).    // Set the calculated height
+		MaxHeight(mainHeight). // Ensure it doesn't grow beyond this
+		Width(m.width).        // Use available width
+		MaxWidth(m.width).
+		Render(mainContent) // Render the combined (CPU + panels) content
+
+	// Use JoinVertical to place the constrained main content *above* the footer elements.
+	finalView := lipgloss.JoinVertical(lipgloss.Left,
+		mainContentView,
+		inputArea,
+		helpHint,
+	)
+
+	// Return the fully assembled view
+	// Note: We don't need the MaxWidth render here anymore as we applied width to mainContentView
+	return finalView
 }
 
 func main() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen()) // Use AltScreen for cleaner exit
-
-	if err := p.Start(); err != nil {
-		log.Fatalf("Error running program: %v", err)
+	// --- Logging Setup ---
+	logFile, err := os.OpenFile("go6502repl.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println("Error opening log file:", err)
 		os.Exit(1)
 	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+	log.Println("--- Application Start ---")
+
+	// --- Run Bubbletea ---
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen()) // Use AltScreen for cleaner exit
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Alas, there's been an error: %v", err)
+		log.Printf("Runtime error: %v", err)
+		os.Exit(1)
+	}
+	log.Println("--- Application End ---")
 }

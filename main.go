@@ -19,27 +19,6 @@ import (
 const serialAddr uint16 = 0xF001
 const defaultLoadAddr uint16 = 0x0200 // Common area for small programs
 
-// --- Test Program ---
-// Simple program to write "Hello World!\n" to serial output (0xF001)
-// and then loop indefinitely.
-// Org $0200
-var helloWorldProgram = []uint8{
-	// Start: $0200
-	0xA2, 0x00, // LDX #$00      ; X = 0 (index into message)
-	// Loop: $0202
-	0xBD, 0x10, 0x02, // LDA Message,X ; Load character A = RAM[0x0210 + X]
-	0x8D, 0x01, 0xF0, // STA $F001     ; Write character to serial
-	0xE8,       // INX             ; Increment index
-	0xE0, 0x0E, // CPX #$0E      ; Compare X to length (14 chars incl. null)
-	0xD0, 0xF5, // BNE Loop      ; Branch back to $0202 if not equal
-	// Finished: $020C
-	0xEA, // NOP           ; <<< Breakpoint target after loop finishes
-	// Halt: $020D (Optional infinite loop after NOP)
-	0x4C, 0x0D, 0x02, // JMP Halt      ; Loop here indefinitely after hitting NOP
-	// Message: (Starts at 0x0210)
-	'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!', '\n', 0x00, // The message + null terminator
-}
-
 // --- Bubbletea Model ---
 
 type Mode int
@@ -93,14 +72,6 @@ func initialModel() model {
 	ti.Focus()
 	ti.CharLimit = 156
 	ti.Width = 50
-
-	// --- Load Program ---
-	err := mainBus.LoadProgram(defaultLoadAddr, helloWorldProgram)
-	if err != nil {
-		log.Fatalf("Failed to load program: %v", err) // Fatal on initial load fail
-	}
-	cpuCore.PC = defaultLoadAddr // Set PC to start of loaded program
-	// cpuCore.Reset() // Alternatively, if program is at reset vector target
 
 	m := model{
 		cpu:            cpuCore,
@@ -257,18 +228,10 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		m.textInput.Focus()
 		return textinput.Blink
 	case "reset":
-		m.cpu.Reset()
-		m.serial.ClearOutput()
-		// Reload program and set PC after reset
-		err := m.bus.LoadProgram(defaultLoadAddr, helloWorldProgram)
-		if err != nil {
-			m.err = err
-			m.message = fmt.Sprintf("Error reloading program: %v", err)
-		} else {
-			m.cpu.PC = defaultLoadAddr
-			m.breakpoints = make(map[uint16]bool) // Clear breakpoints on reset
-			m.message = fmt.Sprintf("CPU Reset. Program reloaded. Breakpoints cleared. PC set to $%04X.", m.cpu.PC)
-		}
+		m.serial.ClearOutput()                // Clear serial output
+		m.cpu.Reset()                         // Reset CPU to reset vector
+		m.breakpoints = make(map[uint16]bool) // Clear breakpoints on reset
+		m.message = fmt.Sprintf("CPU Reset. Program reloaded. Breakpoints cleared. PC set to $%04X.", m.cpu.PC)
 	case "m", "mem":
 		if len(parts) < 2 {
 			m.message = "Usage: m <addr> (e.g., m 0200 or m $C000)"

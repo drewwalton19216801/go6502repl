@@ -1,6 +1,6 @@
-; hello.s - Prints "Hello World!" to the serial port ($F001)
-; Assemble with: ca65 hello.s -o hello.o
-; Link with:     ld65 -o hello.bin -C memory.cfg hello.o
+; helloworld.asm - Prints "Hello World!" to the serial port ($F001)
+; Assemble with: ca65 helloworld.asm -o helloworld.o
+; Link with:     ld65 -o helloworld.bin -C memory.cfg helloworld.o
 ; (Requires a simple memory.cfg file, see below)
 
 .setcpu "6502"      ; Target CPU
@@ -18,10 +18,9 @@ SERIAL_PORT = $F001 ; Memory address for serial output
 ; --- Code Segment ---
 .segment "CODE"
 .proc main          ; Define the main procedure (helps with label scope)
+    .export start   ; Make the 'start' label globally visible
 
-    ; Set the starting address for this code block.
-    ; This overrides linker placement for this specific block.
-    .org $C000
+    ; Let the linker place code based on memory.cfg
 
 start:
     ldx #$00        ; Initialize string index X to 0
@@ -42,7 +41,7 @@ loop:
     jmp loop        ; Repeat for the next character
 
 end_loop:
-    brk             ; Halt execution (or use JMP end_loop for infinite halt)
+    jmp end_loop             ; Infinite loop
 
 .endproc
 
@@ -52,3 +51,19 @@ hello_string:
     .byte "Hello World!" ; Use .byte to define the ASCII string
     .byte $0A           ; Add the Line Feed character manually
     .byte $00           ; Add the null terminator manually
+
+; --- Vector Table Segment ---
+; The linker will place this segment starting at $FFFA as per memory.cfg
+.segment "VECTORS"
+  .addr nmi_handler   ; $FFFA/$FFFB - Non-Maskable Interrupt vector
+  .addr main::start         ; $FFFC/$FFFD - Reset vector (points to our code entry)
+  .addr irq_handler   ; $FFFE/$FFFF - Interrupt Request vector
+
+; --- Dummy Interrupt Handlers (place in CODE segment) ---
+; These are defined outside 'main' proc, so they are global by default
+.segment "CODE"
+nmi_handler:
+irq_handler:
+    rti             ; Return from Interrupt (essential minimal handler)
+
+.segment "VECTORS"  ; Vector table segment

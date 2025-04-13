@@ -24,16 +24,18 @@ const defaultLoadAddr uint16 = 0x0200 // Common area for small programs
 // and then loop indefinitely.
 // Org $0200
 var helloWorldProgram = []uint8{
-	// Start:
+	// Start: $0200
 	0xA2, 0x00, // LDX #$00      ; X = 0 (index into message)
-	// Loop:
+	// Loop: $0202
 	0xBD, 0x10, 0x02, // LDA Message,X ; Load character A = RAM[0x0210 + X]
 	0x8D, 0x01, 0xF0, // STA $F001     ; Write character to serial
 	0xE8,       // INX             ; Increment index
 	0xE0, 0x0E, // CPX #$0E      ; Compare X to length (14 chars incl. null)
-	0xD0, 0xF5, // BNE Loop      ; Branch back if not equal
-	// Halt:
-	0x4C, 0x0C, 0x02, // JMP Halt      ; Infinite loop jump to self (0x020C)
+	0xD0, 0xF5, // BNE Loop      ; Branch back to $0202 if not equal
+	// Finished: $020C
+	0xEA, // NOP           ; <<< Breakpoint target after loop finishes
+	// Halt: $020D (Optional infinite loop after NOP)
+	0x4C, 0x0D, 0x02, // JMP Halt      ; Loop here indefinitely after hitting NOP
 	// Message: (Starts at 0x0210)
 	'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!', '\n', 0x00, // The message + null terminator
 }
@@ -52,10 +54,11 @@ type model struct {
 	bus    *MainBus
 	serial *SerialDevice
 
-	textInput textinput.Model
-	mode      Mode
-	err       error
-	message   string // General status messages
+	textInput   textinput.Model
+	mode        Mode
+	err         error
+	message     string          // General status messages
+	breakpoints map[uint16]bool // Stores addresses of active breakpoints
 
 	width, height int
 
@@ -105,7 +108,8 @@ func initialModel() model {
 		serial:         serialDev,
 		textInput:      ti,
 		mode:           CommandMode,
-		memViewAddr:    defaultLoadAddr, // Start memory view near code
+		breakpoints:    make(map[uint16]bool), // Initially no breakpoints
+		memViewAddr:    defaultLoadAddr,       // Start memory view near code
 		styleHelp:      lipgloss.NewStyle().Faint(true),
 		styleCPU:       lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
 		styleDisasm:    lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
@@ -171,6 +175,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		if m.mode == RunningMode {
+			// --- Breakpoint Check ---
+			// Check *before* executing the instruction at PC if Cycles is 0
+			if m.cpu.Cycles == 0 {
+				currentPC := m.cpu.PC
+				if _, hit := m.breakpoints[currentPC]; hit {
+					// Breakpoint Hit!
+					m.mode = CommandMode // Switch to command mode
+					m.message = fmt.Sprintf("Breakpoint hit at $%04X", currentPC)
+					m.textInput.Focus()
+					m.updateViews() // Update views to show paused state
+					// Return *without* executing the instruction or scheduling next tick
+					return m, textinput.Blink
+				}
+			}
+
 			// Execute one CPU clock cycle
 			m.cpu.Clock()
 			// Continue ticking only if Cycles > 0 or if instruction finished
@@ -206,7 +225,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 
 	switch command {
 	case "h", "help":
-		m.message = "Commands: s[tep], r[un], p[ause], reset, m[em] <addr>,\n d[isasm], load <file> <addr>, ser[ial], q[uit]"
+		m.message = "Commands: s[tep], r[un], p[ause], reset, m[em] <addr>,\n b[reak] <addr>, cb <addr>, lb, d[isasm], load <file> <addr>, ser[ial], q[uit]"
 	case "s", "step":
 		// Execute one full instruction
 		m.message = "Stepping..."
@@ -247,7 +266,8 @@ func (m *model) handleCommand(input string) tea.Cmd {
 			m.message = fmt.Sprintf("Error reloading program: %v", err)
 		} else {
 			m.cpu.PC = defaultLoadAddr
-			m.message = "CPU Reset. Program reloaded. PC set to $0200."
+			m.breakpoints = make(map[uint16]bool) // Clear breakpoints on reset
+			m.message = fmt.Sprintf("CPU Reset. Program reloaded. Breakpoints cleared. PC set to $%04X.", m.cpu.PC)
 		}
 	case "m", "mem":
 		if len(parts) < 2 {
@@ -306,6 +326,71 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		// m.cpu.PC = loadAddr
 		// m.message += fmt.Sprintf(" PC set to $%04X.", loadAddr)
 		m.updateViews() // Refresh memory/disassembly
+	case "b", "break": // <-- Add Breakpoint
+		if len(parts) != 2 {
+			m.err = fmt.Errorf("usage: b <hex_address>")
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+		addrStr := strings.TrimPrefix(parts[1], "$")
+		addr64, err := strconv.ParseUint(addrStr, 16, 16)
+		if err != nil {
+			m.err = fmt.Errorf("invalid breakpoint address format '%s': %w", parts[1], err)
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+		addr := uint16(addr64)
+		m.breakpoints[addr] = true
+		m.message = fmt.Sprintf("Breakpoint set at $%04X.", addr)
+	case "cb", "clearbreak": // <-- Clear Breakpoint
+		if len(parts) != 2 {
+			m.err = fmt.Errorf("usage: cb <hex_address>")
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+		addrStr := strings.TrimPrefix(parts[1], "$")
+		addr64, err := strconv.ParseUint(addrStr, 16, 16)
+		if err != nil {
+			m.err = fmt.Errorf("invalid breakpoint address format '%s': %w", parts[1], err)
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+		addr := uint16(addr64)
+		if _, exists := m.breakpoints[addr]; exists {
+			delete(m.breakpoints, addr)
+			m.message = fmt.Sprintf("Breakpoint cleared at $%04X.", addr)
+		} else {
+			m.message = fmt.Sprintf("No breakpoint found at $%04X.", addr)
+		}
+	case "lb", "listbreaks": // <-- List Breakpoints
+		if len(m.breakpoints) == 0 {
+			m.message = "No breakpoints set."
+		} else {
+			var sb strings.Builder
+			sb.WriteString("Breakpoints set at: ")
+			first := true
+			// Sort keys for consistent output
+			keys := make([]uint16, 0, len(m.breakpoints))
+			for k := range m.breakpoints {
+				keys = append(keys, k)
+			}
+			// Simple sort
+			for i := 0; i < len(keys); i++ {
+				for j := i + 1; j < len(keys); j++ {
+					if keys[i] > keys[j] {
+						keys[i], keys[j] = keys[j], keys[i]
+					}
+				}
+			}
+			for _, addr := range keys {
+				if !first {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(fmt.Sprintf("$%04X", addr))
+				first = false
+			}
+			m.message = sb.String()
+		}
 	case "ser", "serial":
 		// Serial view is updated automatically, this command could be used
 		// for other serial actions later (e.g., clear, show status)

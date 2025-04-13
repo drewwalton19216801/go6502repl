@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -205,7 +206,7 @@ func (m *model) handleCommand(input string) tea.Cmd {
 
 	switch command {
 	case "h", "help":
-		m.message = "Commands: s[tep], r[un], p[ause], reset, m[em] <addr>, d[isasm], ser[ial], q[uit]"
+		m.message = "Commands: s[tep], r[un], p[ause], reset, m[em] <addr>,\n d[isasm], load <file> <addr>, ser[ial], q[uit]"
 	case "s", "step":
 		// Execute one full instruction
 		m.message = "Stepping..."
@@ -265,6 +266,46 @@ func (m *model) handleCommand(input string) tea.Cmd {
 	case "d", "disasm":
 		// Disassembly view is updated automatically, but this forces refresh
 		m.message = "Disassembly view refreshed."
+	case "load", "l": // Load program from file
+		if len(parts) != 3 {
+			m.err = fmt.Errorf("usage: [l]oad <filepath.bin> <hex_address>")
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+		filePath := parts[1]
+		addrStr := strings.TrimPrefix(parts[2], "$") // Allow optional $ prefix
+
+		// Parse address
+		loadAddr64, err := strconv.ParseUint(addrStr, 16, 16)
+		if err != nil {
+			m.err = fmt.Errorf("invalid load address format '%s': %w", parts[2], err)
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+		loadAddr := uint16(loadAddr64)
+
+		// Read file content
+		programData, err := os.ReadFile(filePath)
+		if err != nil {
+			m.err = fmt.Errorf("failed to read file '%s': %w", filePath, err)
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+
+		// Load into bus memory
+		err = m.bus.LoadProgram(loadAddr, programData)
+		if err != nil {
+			m.err = fmt.Errorf("failed to load program into memory: %w", err)
+			m.message = fmt.Sprintf("Error: %v", m.err)
+			return nil
+		}
+
+		// Success!
+		m.message = fmt.Sprintf("Loaded %d bytes from '%s' to $%04X.", len(programData), filepath.Base(filePath), loadAddr)
+		// Optional: Set PC automatically? Decided against for now.
+		// m.cpu.PC = loadAddr
+		// m.message += fmt.Sprintf(" PC set to $%04X.", loadAddr)
+		m.updateViews() // Refresh memory/disassembly
 	case "ser", "serial":
 		// Serial view is updated automatically, this command could be used
 		// for other serial actions later (e.g., clear, show status)
@@ -440,7 +481,7 @@ func (m model) View() string {
 	// --- Render Footer ---
 	// Render input and help text separately for the footer
 	inputArea := m.styleInput.Render(m.textInput.View())
-	helpHint := m.styleHelp.Render("step(s) run(r) pause(p) reset mem(m) serial(ser) help(h) quit(q)")
+	helpHint := m.styleHelp.Render("step(s) run(r) pause(p) reset mem(m) disasm(d) load(l) serial(ser) help(h) quit(q)")
 
 	// --- Final Assembly ---
 	// Render the main content with a *maximum* height constraint.

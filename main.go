@@ -250,22 +250,28 @@ func (m *model) handleCommand(input string) tea.Cmd {
 		// Disassembly view is updated automatically, but this forces refresh
 		m.message = "Disassembly view refreshed."
 	case "load", "l": // Load program from file
-		if len(parts) != 3 {
-			m.err = fmt.Errorf("usage: [l]oad <filepath.bin> <hex_address>")
+		if len(parts) < 2 {
+			m.err = fmt.Errorf("usage: [l]oad <filepath.bin> [hex_address]")
 			m.message = fmt.Sprintf("Error: %v", m.err)
 			return nil
 		}
 		filePath := parts[1]
-		addrStr := strings.TrimPrefix(parts[2], "$") // Allow optional $ prefix
 
-		// Parse address
-		loadAddr64, err := strconv.ParseUint(addrStr, 16, 16)
-		if err != nil {
-			m.err = fmt.Errorf("invalid load address format '%s': %w", parts[2], err)
-			m.message = fmt.Sprintf("Error: %v", m.err)
-			return nil
+		// Default load address to 0x0000 if not specified
+		loadAddr := uint16(0x0000)
+		if len(parts) == 3 {
+			addrStr := strings.TrimPrefix(parts[2], "$") // Allow optional $ prefix
+			// Parse address
+			loadAddr64, err := strconv.ParseUint(addrStr, 16, 16)
+			if err != nil {
+				m.err = fmt.Errorf("invalid load address format '%s': %w", parts[2], err)
+				m.message = fmt.Sprintf("Error: %v", m.err)
+				return nil
+			}
+			loadAddr = uint16(loadAddr64)
+		} else {
+			m.message = "No address specified, loading at $0000"
 		}
-		loadAddr := uint16(loadAddr64)
 
 		// Read file content
 		programData, err := os.ReadFile(filePath)
@@ -285,9 +291,6 @@ func (m *model) handleCommand(input string) tea.Cmd {
 
 		// Success!
 		m.message = fmt.Sprintf("Loaded %d bytes from '%s' to $%04X.", len(programData), filepath.Base(filePath), loadAddr)
-		// Optional: Set PC automatically? Decided against for now.
-		// m.cpu.PC = loadAddr
-		// m.message += fmt.Sprintf(" PC set to $%04X.", loadAddr)
 		m.updateViews() // Refresh memory/disassembly
 	case "b", "break": // <-- Add Breakpoint
 		if len(parts) != 2 {

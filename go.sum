@@ -22,6 +22,8 @@ github.com/drewwalton19216801/sixty502 v0.0.0-20250412210450-10a8055132dc h1:Vmm
 github.com/drewwalton19216801/sixty502 v0.0.0-20250412210450-10a8055132dc/go.mod h1:3tckiyQbOXxvDGKpp9yoJF3d85tE+Rnfyl3g975iDYE=
 github.com/drewwalton19216801/sixty502 v0.0.0-20250413184436-b72070523ea8 h1:czN44D76sx93wxBVVBfp3YtyoEZ4FrWQ/4Gw1hVGQis=
 github.com/drewwalton19216801/sixty502 v0.0.0-20250413184436-b72070523ea8/go.mod h1:3tckiyQbOXxvDGKpp9yoJF3d85tE+Rnfyl3g975iDYE=
+github.com/drewwalton19216801/sixty502 v0.0.0-20250609212450-019a6dc64435 h1:JHnVulP5A5tikCQKami0x8NGGKsNjksb19FVWyNBg/M=
+github.com/drewwalton19216801/sixty502 v0.0.0-20250609212450-019a6dc64435/go.mod h1:3tckiyQbOXxvDGKpp9yoJF3d85tE+Rnfyl3g975iDYE=
 github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f h1:Y/CXytFA4m6baUTXGLOoWe4PQhGxaX0KpnayAqC48p4=
 github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f/go.mod h1:vw97MGsxSvLiUE2X8qFplwetxpGLQrlU1Q9AUEIzCaM=
 github.com/lucasb-eyer/go-colorful v1.2.0 h1:1nnpGOrhyZZuNyfu1QjKiUICQ74+3FNCN69Aj6K7nkY=
